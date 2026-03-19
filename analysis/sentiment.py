@@ -1,26 +1,20 @@
 """Stage 1: LLM sentiment analysis via OpenRouter API.
 
 Mega-batch design: packs 800 posts per API call.
-Uses NVIDIA Nemotron 3 Super (free) via OpenRouter's OpenAI-compatible API.
-High concurrency — no more CLI bottleneck.
+Uses free models via OpenRouter with automatic fallback.
 """
 
 import json
-import os
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from openai import OpenAI
 
-# ── Config ──
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+from llm_client import get_client
 
-MEGA_BATCH_SIZE = 800   # Posts per API call
-MAX_CONCURRENT = 5      # API concurrency (no CLI bottleneck)
-MAX_TEXT_LEN = 200       # Truncate each post to save tokens
+MEGA_BATCH_SIZE = 800
+MAX_CONCURRENT = 5
+MAX_TEXT_LEN = 200
 
 
 @dataclass
@@ -55,11 +49,7 @@ class SentimentAnalyzer:
     """Analyze sentiment using OpenRouter API with mega-batch prompts."""
 
     def __init__(self):
-        self.client = OpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
-        )
-        self.model = OPENROUTER_MODEL
+        self.llm = get_client()
 
     def analyze_all(self, posts: list[dict]) -> SentimentStats:
         if not posts:
@@ -69,7 +59,7 @@ class SentimentAnalyzer:
 
         n_batches = max(1, -(-len(valid_posts) // MEGA_BATCH_SIZE))
         print(f"[Sentiment] Scoring {len(valid_posts)} posts in {n_batches} mega-batch(es), "
-              f"{MAX_CONCURRENT} concurrent, model={self.model}")
+              f"{MAX_CONCURRENT} concurrent, model={self.llm.current_model}")
 
         scored_posts = self._mega_batch_score(valid_posts)
         print(f"[Sentiment] Successfully scored {len(scored_posts)} posts")
@@ -79,16 +69,8 @@ class SentimentAnalyzer:
 
         return self._compute_stats(scored_posts, len(posts))
 
-    # ── API call ──
-
     def _call_llm(self, prompt: str) -> str:
-        """Call OpenRouter API via OpenAI SDK."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        return response.choices[0].message.content.strip()
+        return self.llm.call(prompt, temperature=0.1)
 
     # ── Mega-batch scoring ──
 
