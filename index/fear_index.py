@@ -17,24 +17,15 @@ LABELS = [
 
 
 def calculate_fear_index(market_scores: dict, sentiment_score: float) -> dict:
-    components = {
-        "volatility": {
-            "score": market_scores.get("volatility", 50),
-            "weight": WEIGHTS["volatility"],
-        },
-        "momentum": {
-            "score": market_scores.get("momentum", 50),
-            "weight": WEIGHTS["momentum"],
-        },
-        "dominance": {
-            "score": market_scores.get("dominance", 50),
-            "weight": WEIGHTS["dominance"],
-        },
-        "mirofish_sentiment": {
-            "score": sentiment_score,
-            "weight": WEIGHTS["mirofish_sentiment"],
-        },
-    }
+    components = {}
+    for key, weight in WEIGHTS.items():
+        if key == "mirofish_sentiment":
+            components[key] = {"score": sentiment_score, "weight": weight}
+        else:
+            components[key] = {
+                "score": market_scores.get(key, 50),
+                "weight": weight,
+            }
 
     total = sum(c["score"] * c["weight"] for c in components.values())
     total_weight = sum(c["weight"] for c in components.values())

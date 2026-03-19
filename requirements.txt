@@ -4,9 +4,12 @@ requests>=2.31.0
 # Scrapers
 playwright>=1.40.0
 twikit>=2.0.0
-praw>=7.7.0
 
-# MiroFish integration: uses `claude` CLI (OAuth), no SDK needed
+# Infographic
+matplotlib>=3.8.0
+
+# LLM (OpenRouter API, OpenAI-compatible)
+openai>=1.0.0
 
 # Utils
 python-dotenv>=1.0.0

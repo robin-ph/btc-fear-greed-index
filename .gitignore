@@ -32,3 +32,17 @@ twitter_cookies.json
 
 # Proxy
 claude_proxy.py
+
+# Daily agent output
+output/
+results/
+backtest_results.json
+
+# Generated images (regeneratable)
+banner.png
+infographic.png
+
+# Articles / notes (not code)
+twitter_article.txt
+twitter_article_short.txt
+总结.md

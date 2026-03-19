@@ -1,28 +1,26 @@
-"""Stage 1: LLM-powered sentiment analysis of ALL scraped social data.
+"""Stage 1: LLM sentiment analysis via OpenRouter API.
 
-Uses DeepSeek API to batch-analyze all posts with proper crypto context
-understanding. VADER fails on crypto content (sarcasm, slang, neutral
-discussion posts scored as extreme greed).
-
-DeepSeek-chat is extremely cheap (~$0.001 per 1000 tokens) so analyzing
-3000 posts costs essentially nothing.
+Mega-batch design: packs 800 posts per API call.
+Uses NVIDIA Nemotron 3 Super (free) via OpenRouter's OpenAI-compatible API.
+High concurrency — no more CLI bottleneck.
 """
 
 import json
-import re
-import time
-from datetime import datetime, timezone, timedelta
+import os
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from openai import OpenAI
 
+# ── Config ──
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 
-import os
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-BATCH_SIZE = 40  # Posts per batch
+MEGA_BATCH_SIZE = 800   # Posts per API call
+MAX_CONCURRENT = 5      # API concurrency (no CLI bottleneck)
+MAX_TEXT_LEN = 200       # Truncate each post to save tokens
 
 
 @dataclass
@@ -31,25 +29,19 @@ class SentimentStats:
     total_posts: int = 0
     analyzed_posts: int = 0
 
-    # Sentiment distribution (0-100, 0=extreme fear, 100=extreme greed)
     mean_score: float = 50.0
     median_score: float = 50.0
     std_score: float = 0.0
 
-    # Extreme ratios
     extreme_fear_ratio: float = 0.0
     fear_ratio: float = 0.0
     neutral_ratio: float = 0.0
     greed_ratio: float = 0.0
     extreme_greed_ratio: float = 0.0
 
-    # Weighted score (by engagement)
     weighted_score: float = 50.0
-
-    # Per-source breakdown
     source_scores: dict = field(default_factory=dict)
 
-    # Representative posts for OASIS
     top_fear_posts: list = field(default_factory=list)
     top_greed_posts: list = field(default_factory=list)
     representative_posts: list = field(default_factory=list)
@@ -60,44 +52,55 @@ class SentimentStats:
 
 
 class SentimentAnalyzer:
-    """Analyze sentiment using DeepSeek LLM for crypto-aware scoring."""
+    """Analyze sentiment using OpenRouter API with mega-batch prompts."""
 
     def __init__(self):
         self.client = OpenAI(
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            base_url=OPENROUTER_BASE_URL,
         )
+        self.model = OPENROUTER_MODEL
 
-    def analyze_all(self, posts: list[dict], hours_filter: int = 24) -> SentimentStats:
-        """Batch-analyze all posts with DeepSeek."""
+    def analyze_all(self, posts: list[dict]) -> SentimentStats:
         if not posts:
             return SentimentStats()
 
-        # Filter out very short / empty posts
         valid_posts = [p for p in posts if len(p.get("text", "")) > 15]
 
-        # Batch score with DeepSeek
-        print(f"[Sentiment] Scoring {len(valid_posts)} posts in batches of {BATCH_SIZE}...")
-        scored_posts = self._batch_score(valid_posts)
+        n_batches = max(1, -(-len(valid_posts) // MEGA_BATCH_SIZE))
+        print(f"[Sentiment] Scoring {len(valid_posts)} posts in {n_batches} mega-batch(es), "
+              f"{MAX_CONCURRENT} concurrent, model={self.model}")
+
+        scored_posts = self._mega_batch_score(valid_posts)
         print(f"[Sentiment] Successfully scored {len(scored_posts)} posts")
 
         if not scored_posts:
             return SentimentStats()
 
-        # Compute statistics
         return self._compute_stats(scored_posts, len(posts))
 
-    def _batch_score(self, posts: list[dict]) -> list[dict]:
-        """Score all posts in parallel batches using DeepSeek."""
+    # ── API call ──
+
+    def _call_llm(self, prompt: str) -> str:
+        """Call OpenRouter API via OpenAI SDK."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        return response.choices[0].message.content.strip()
+
+    # ── Mega-batch scoring ──
+
+    def _mega_batch_score(self, posts: list[dict]) -> list[dict]:
         batches = []
-        for i in range(0, len(posts), BATCH_SIZE):
-            batches.append(posts[i:i + BATCH_SIZE])
+        for i in range(0, len(posts), MEGA_BATCH_SIZE):
+            batches.append(posts[i:i + MEGA_BATCH_SIZE])
 
         scored = []
-        # Process batches with thread pool (4 concurrent API calls)
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
             futures = {
-                executor.submit(self._score_batch, batch, idx): idx
+                executor.submit(self._score_one_batch, batch, idx): idx
                 for idx, batch in enumerate(batches)
             }
             for future in as_completed(futures):
@@ -105,85 +108,66 @@ class SentimentAnalyzer:
                 try:
                     batch_results = future.result()
                     scored.extend(batch_results)
-                    if (idx + 1) % 10 == 0:
-                        print(f"[Sentiment] Completed {idx + 1}/{len(batches)} batches...")
+                    print(f"[Sentiment] Batch {idx + 1}/{len(batches)} done "
+                          f"({len(batch_results)} scored)")
                 except Exception as e:
-                    print(f"[Sentiment] Batch {idx} failed: {e}")
+                    print(f"[Sentiment] Batch {idx + 1} failed: {e}")
+                    scored.extend(self._fallback_score(batches[idx]))
+                    print(f"[Sentiment] Batch {idx + 1} fell back to keyword scoring")
 
         return scored
 
-    def _score_batch(self, batch: list[dict], batch_idx: int) -> list[dict]:
-        """Score a single batch of posts with DeepSeek."""
-        # Build the prompt with numbered posts
+    def _score_one_batch(self, batch: list[dict], batch_idx: int) -> list[dict]:
         post_lines = []
         for i, post in enumerate(batch):
-            text = post.get("text", "")[:300].replace("\n", " ")
-            source = post.get("source", "?")
-            post_lines.append(f"{i}|{source}|{text}")
+            text = post.get("text", "")[:MAX_TEXT_LEN].replace("\n", " ").strip()
+            post_lines.append(f"{i}|{text}")
 
         posts_block = "\n".join(post_lines)
 
-        prompt = f"""Score each crypto social media post's MARKET SENTIMENT on a 0-100 scale.
+        prompt = f"""Rate each post's BTC market sentiment. Scale: 0=extreme fear, 50=neutral, 100=extreme greed.
 
-IMPORTANT RULES:
-- 0 = extreme fear/panic about BTC price (selling, crashing, liquidation, despair)
-- 50 = neutral (questions, news, discussion not expressing fear or greed)
-- 100 = extreme greed/euphoria about BTC price (mooning, ATH, FOMO buying)
-- Posts about personal purchases, DCA, wallets, mining hardware = 50 (neutral, NOT greed)
-- "Daily Discussion" threads, FAQ posts, mod posts = 50 (neutral)
-- Sarcasm/irony: score based on the ACTUAL sentiment being expressed
-- News/analysis without clear sentiment = 50
-- Non-English posts: analyze based on content
+Rules:
+- 0-20: panic selling, crash fear, liquidation despair
+- 40-60: questions, news, DCA, wallet talk, discussion threads, neutral analysis
+- 80-100: FOMO, mooning, ATH euphoria
+- Sarcasm → rate the actual underlying sentiment
+- Non-English → analyze content meaning
 
-Posts (format: index|source|text):
+{len(batch)} posts (format: index|text):
 {posts_block}
 
-Output ONLY a JSON array of [index, score] pairs. Example: [[0,25],[1,72],[2,50]]
-No explanation, just the JSON array."""
+Reply with ONLY a JSON array of [index, score] pairs. No explanation.
+Example: [[0,25],[1,72],[2,50]]"""
 
-        try:
-            response = self.client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.1,
-            )
+        text = self._call_llm(prompt)
 
-            result_text = response.choices[0].message.content.strip()
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start < 0 or end <= start:
+            raise ValueError(f"No JSON array in response (len={len(text)})")
 
-            # Parse JSON array
-            # Find the array in the response
-            start = result_text.find("[")
-            end = result_text.rfind("]") + 1
-            if start >= 0 and end > start:
-                scores_array = json.loads(result_text[start:end])
-            else:
-                return self._fallback_score(batch)
+        scores_array = json.loads(text[start:end])
 
-            # Map scores back to posts
-            score_map = {}
-            for item in scores_array:
-                if isinstance(item, list) and len(item) == 2:
+        score_map = {}
+        for item in scores_array:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                try:
                     score_map[int(item[0])] = max(0, min(100, float(item[1])))
+                except (ValueError, TypeError):
+                    continue
 
-            scored = []
-            for i, post in enumerate(batch):
-                score = score_map.get(i, 50)
-                weight = self._compute_weight(post)
-                scored.append({
-                    **post,
-                    "_score": score,
-                    "_weight": weight,
-                })
+        scored = []
+        for i, post in enumerate(batch):
+            score = score_map.get(i, 50)
+            weight = self._compute_weight(post)
+            scored.append({**post, "_score": score, "_weight": weight})
 
-            return scored
+        return scored
 
-        except Exception as e:
-            # Fallback to simple keyword scoring
-            return self._fallback_score(batch)
+    # ── Fallback ──
 
     def _fallback_score(self, batch: list[dict]) -> list[dict]:
-        """Simple keyword-based fallback if API fails."""
         fear_words = {"crash", "dump", "liquidat", "rekt", "panic", "sell", "bear",
                       "plunge", "collapse", "blood", "fear", "暴跌", "崩盘", "爆仓", "恐慌"}
         greed_words = {"moon", "pump", "bull", "rally", "ath", "buy", "hodl",
@@ -205,8 +189,9 @@ No explanation, just the JSON array."""
             scored.append({**post, "_score": score, "_weight": self._compute_weight(post)})
         return scored
 
+    # ── Statistics ──
+
     def _compute_weight(self, post: dict) -> float:
-        """Engagement-based weight."""
         w = 1.0
         for key in ["score", "num_comments", "likes", "retweets"]:
             val = abs(post.get(key, 0))
@@ -215,14 +200,11 @@ No explanation, just the JSON array."""
         return w
 
     def _compute_stats(self, scored_posts: list[dict], total_raw: int) -> SentimentStats:
-        """Compute statistics from scored posts."""
         scores = np.array([p["_score"] for p in scored_posts])
         weights = np.array([p["_weight"] for p in scored_posts])
 
-        # Weighted average
         weighted_avg = float(np.average(scores, weights=weights))
 
-        # Distribution
         n = len(scores)
         extreme_fear = float(np.sum(scores < 20) / n)
         fear = float(np.sum((scores >= 20) & (scores < 40)) / n)
@@ -230,7 +212,6 @@ No explanation, just the JSON array."""
         greed = float(np.sum((scores >= 60) & (scores < 80)) / n)
         extreme_greed = float(np.sum(scores >= 80) / n)
 
-        # Per-source
         source_scores = {}
         for p in scored_posts:
             src = p.get("source", "unknown")
@@ -239,7 +220,6 @@ No explanation, just the JSON array."""
             source_scores[src].append(p["_score"])
         source_avgs = {s: round(float(np.mean(v)), 1) for s, v in source_scores.items()}
 
-        # Select posts for OASIS
         sorted_by_score = sorted(scored_posts, key=lambda p: p["_score"])
         top_fear = sorted_by_score[:30]
         top_greed = sorted_by_score[-30:]
@@ -264,7 +244,6 @@ No explanation, just the JSON array."""
         )
 
     def _stratified_sample(self, posts: list[dict], n: int = 50) -> list[dict]:
-        """Select stratified sample across sentiment buckets."""
         buckets = {"ef": [], "f": [], "n": [], "g": [], "eg": []}
         for p in posts:
             s = p["_score"]
@@ -293,11 +272,10 @@ No explanation, just the JSON array."""
 
 
 def format_sentiment_report(stats: SentimentStats) -> str:
-    """Format sentiment analysis report."""
     lines = [
         "",
         "┌─────────────────────────────────────────────────┐",
-        "│    Stage 1: LLM Sentiment Analysis (DeepSeek)   │",
+        "│    Stage 1: LLM Sentiment Analysis (Nemotron)    │",
         "├─────────────────────────────────────────────────┤",
         f"│  Posts analyzed: {stats.analyzed_posts:>6,d} / {stats.total_posts:>6,d}          │",
         f"│  Mean sentiment:  {stats.mean_score:>5.1f} / 100                 │",

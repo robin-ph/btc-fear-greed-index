@@ -1,4 +1,4 @@
-"""Binance Square mass scraper - multiple hashtags with deep scrolling."""
+"""Binance Square scraper — hardened for daily cron runs."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -13,57 +13,34 @@ class BinanceSquareScraper:
         self.collected_posts = []
 
     async def scrape(self) -> list[dict]:
-        """Scrape BTC-related posts from multiple Binance Square hashtags."""
         self.collected_posts = []
         seen = set()
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-            )
-
-            for hashtag in BINANCE_SQUARE_HASHTAGS:
-                if len(self.collected_posts) >= self.max_posts:
-                    break
-
-                page = await context.new_page()
-                page.on("response", self._on_response)
-
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
                 try:
-                    url = f"https://www.binance.com/en/square/hashtag/{hashtag}"
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(5000)
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1280, "height": 800},
+                    )
 
-                    # Deep scroll to load more posts
-                    for scroll in range(20):
+                    for hashtag in BINANCE_SQUARE_HASHTAGS:
                         if len(self.collected_posts) >= self.max_posts:
                             break
-                        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                        await page.wait_for_timeout(1500)
+                        await self._scrape_hashtag(context, hashtag, seen)
 
-                    # DOM fallback
-                    dom_posts = await self._scrape_from_dom(page)
-                    for post in dom_posts:
-                        key = post["text"][:80]
-                        if key not in seen:
-                            seen.add(key)
-                            self.collected_posts.append(post)
-
-                except Exception as e:
-                    if "Timeout" not in str(e):
-                        print(f"[BinanceSquare] Error on #{hashtag}: {e}")
                 finally:
-                    await page.close()
+                    await browser.close()
 
-            await browser.close()
+        except Exception as e:
+            print(f"[BinanceSquare] Browser error: {e}")
 
-        # Deduplicate API-intercepted posts too
+        # Deduplicate
         final = []
         seen2 = set()
         for p in self.collected_posts:
@@ -75,10 +52,47 @@ class BinanceSquareScraper:
         print(f"[BinanceSquare] Total unique posts: {len(final)}")
         return final[:self.max_posts]
 
+    async def _scrape_hashtag(self, context, hashtag: str, seen: set):
+        """Scrape a single hashtag with full error isolation."""
+        page = None
+        try:
+            page = await context.new_page()
+            page.on("response", self._on_response)
+
+            url = f"https://www.binance.com/en/square/hashtag/{hashtag}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            # Deep scroll with timeout guard
+            for _ in range(20):
+                if len(self.collected_posts) >= self.max_posts:
+                    break
+                try:
+                    await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    break
+
+            # DOM fallback
+            dom_posts = await self._scrape_from_dom(page)
+            for post in dom_posts:
+                key = post["text"][:80]
+                if key not in seen:
+                    seen.add(key)
+                    self.collected_posts.append(post)
+
+        except Exception as e:
+            if "Timeout" not in str(e):
+                print(f"[BinanceSquare] #{hashtag} error: {e}")
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
     async def _on_response(self, response):
-        """Intercept API responses containing post data."""
-        url = response.url
-        if "/bapi/" not in url:
+        if "/bapi/" not in response.url:
             return
         try:
             if response.status == 200 and "application/json" in (
@@ -91,7 +105,6 @@ class BinanceSquareScraper:
             pass
 
     def _extract_posts_from_api(self, data: dict) -> list[dict]:
-        """Extract posts from API response."""
         posts = []
 
         def _search(obj, depth=0):
@@ -118,7 +131,6 @@ class BinanceSquareScraper:
         return posts
 
     async def _scrape_from_dom(self, page) -> list[dict]:
-        """Scrape post content from DOM."""
         posts = []
         try:
             all_text = await page.evaluate("""
