@@ -1,6 +1,6 @@
 """OASIS multi-agent simulation with 500 diverse BTC investor agents.
 
-Uses OASIS engine (camel-oasis) with DeepSeek API.
+Uses OASIS engine (camel-oasis) with OpenRouter API (NVIDIA Nemotron).
 Agents interact on simulated Reddit, seeded with real social media
 data from Stage 1 sentiment analysis.
 """
@@ -31,24 +31,26 @@ NUM_AGENTS = 500
 
 
 class OasisSimulator:
-    """Run OASIS multi-agent BTC fear simulation with DeepSeek API."""
+    """Run OASIS multi-agent BTC fear simulation via OpenRouter API."""
 
     def __init__(
         self,
         api_key: str = None,
         base_url: str = None,
-        model_name: str = "deepseek-chat",
+        model_name: str = None,
         num_agents: int = NUM_AGENTS,
     ):
-        api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        base_url = base_url or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        # Use Nano (30B) for agent simulation — fast + cheap, Super for scoring only
+        model_name = model_name or os.getenv("OASIS_MODEL", "nvidia/nemotron-3-nano-30b-a3b")
         self.num_agents = num_agents
         self.model = ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
             model_type=model_name,
             api_key=api_key,
             url=base_url,
-            timeout=120,
+            timeout=180,
         )
 
     async def run_simulation(
@@ -87,7 +89,7 @@ class OasisSimulator:
             agent_graph=agent_graph,
             platform=DefaultPlatformType.REDDIT,
             database_path=db_path,
-            semaphore=16,  # DeepSeek handles high concurrency well
+            semaphore=50,  # OpenRouter paid tier supports high concurrency
         )
 
         print("[OASIS] Resetting environment (signing up agents)...")

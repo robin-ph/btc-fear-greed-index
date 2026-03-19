@@ -27,8 +27,15 @@ result*.json
 *.swo
 .DS_Store
 
-# Playwright
+# Playwright / browser sessions
 twitter_cookies.json
+edge_twitter_session.json
+edge_error.png
+edge_check.png
+edge_final_check.png
+edge_posts.png
+edge_profile.png
+edge_debug/
 
 # Proxy
 claude_proxy.py

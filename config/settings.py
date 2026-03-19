@@ -20,15 +20,17 @@ TWITTER_PASSWORD = os.getenv("TWITTER_PASSWORD", "")
 # === CoinGecko (free, no key needed) ===
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 
-# === Index weights (4-year cycle backtest optimized) ===
+# === Index weights ===
+# MiroFish sentiment (40%) is the core — OASIS 500-agent simulation
+# Market components (60%) split across 6 sub-indicators
 WEIGHTS = {
-    "volatility": 0.47,        # Volatility + drawdown (strongest predictor in backtest)
-    "momentum": 0.14,          # Price momentum + volume trend
-    "derivatives": 0.04,       # Funding rate + long/short ratio
-    "dominance": 0.05,         # BTC market cap dominance
-    "onchain": 0.05,           # Mempool fees + tx volume
-    "mirofish_sentiment": 0.20,  # Social media + agent simulation
-    "google_trends": 0.05,     # Search interest fear/greed
+    "volatility": 0.15,
+    "momentum": 0.15,
+    "dominance": 0.05,
+    "derivatives": 0.10,        # Funding rate + long/short ratio
+    "onchain": 0.10,            # Mempool fees + tx volume
+    "google_trends": 0.05,      # Search interest fear/greed
+    "mirofish_sentiment": 0.40,  # Stage1 LLM + Stage2 OASIS (core)
 }
 
 # === Scraper settings ===

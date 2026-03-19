@@ -22,7 +22,7 @@ from market_data.onchain import OnchainClient
 from mirofish.simulation import MiroFishSimulator
 from index.fear_index import calculate_fear_index
 from generate_infographic import generate_infographic
-from twitter_poster import TwitterPoster
+from edge_poster import post_tweet as edge_post_tweet
 
 
 def collect_social_data(skip_scrapers: list[str] = None) -> list[dict]:
@@ -232,11 +232,9 @@ def save_result(result: dict, output_dir: str = "results") -> str:
 
 
 async def post_to_twitter(image_path: str, tweet_text: str):
-    """Post infographic + text to Twitter/X."""
-    poster = TwitterPoster()
-    tweet_id = await poster.post(tweet_text, image_path)
-    print(f"[*] Tweet posted successfully! ID: {tweet_id}")
-    return tweet_id
+    """Post infographic + text to Twitter/X via Edge browser."""
+    await edge_post_tweet(image_path, tweet_text)
+    print(f"[*] Tweet posted successfully via Edge!")
 
 
 def _mock_social_data() -> list[dict]:

@@ -1,140 +1,18 @@
-"""Two-stage MiroFish sentiment pipeline (OpenRouter API).
+"""Two-stage MiroFish sentiment pipeline.
 
-Stage 1: Mega-batch sentiment scoring via Nemotron
-Stage 2: 500-agent multi-round conversation simulation
-         10 agent types × 3 rounds, batched by type (30 API calls total)
-         Each type generates posts for ALL agents of that type per round
+Stage 1: Mega-batch sentiment scoring of ALL scraped posts (OpenRouter API)
+Stage 2: OASIS 500-agent multi-agent simulation (MiroFish engine via conda)
+         OpenRouter (Nemotron) as LLM backend for agent reasoning
+         Claude/LLM scores the simulation output for contagion analysis
 """
 
 import json
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import subprocess
+import tempfile
 
 from analysis.sentiment import SentimentAnalyzer, SentimentStats, format_sentiment_report
 from llm_client import get_client
-
-NUM_ROUNDS = 3
-TYPE_CONCURRENCY = 3  # Concurrent API calls per round (conservative for free model)
-
-# ── 500 agents: 10 types with realistic distribution ──
-AGENT_TYPES = [
-    {
-        "name": "Retail High Fear",
-        "count": 120,
-        "system": (
-            "You represent 120 retail crypto investors who bought BTC between $60K-$73K. "
-            "They're underwater, panic-prone, check prices every 5 minutes, and heavily "
-            "influenced by fear on social media. Generate {n_posts} SHORT diverse posts "
-            "(1-2 sentences each) from different individuals in this group. "
-            "Vary their intensity: some are about to sell, some are holding but terrified, "
-            "some are asking for reassurance. Number each post."
-        ),
-        "posts_per_round": 8,
-    },
-    {
-        "name": "Moderate Retail",
-        "count": 80,
-        "system": (
-            "You represent 80 retail investors with some crypto experience. "
-            "They bought BTC between $30K-$55K, in profit but worried about giving back gains. "
-            "They try to be rational but get swayed by crowd sentiment. "
-            "Generate {n_posts} SHORT diverse posts (1-2 sentences each). "
-            "Vary: some cautious optimists, some starting to worry, some DCA believers. Number each."
-        ),
-        "posts_per_round": 5,
-    },
-    {
-        "name": "Active Trader",
-        "count": 60,
-        "system": (
-            "You represent 60 active crypto traders focused on technical analysis. "
-            "They trade daily/weekly using chart patterns, support/resistance levels, momentum. "
-            "Generate {n_posts} SHORT diverse posts (1-2 sentences each). "
-            "Reference specific price levels, patterns, indicators. Vary between bullish and bearish reads. Number each."
-        ),
-        "posts_per_round": 4,
-    },
-    {
-        "name": "Leveraged Trader",
-        "count": 40,
-        "system": (
-            "You represent 40 leveraged crypto traders running 5-50x on BTC futures. "
-            "They're extremely sensitive to price swings — a few percent move means liquidation. "
-            "Generate {n_posts} SHORT intense posts (1-2 sentences each). "
-            "Talk about leverage, liquidation levels, funding rates, rekt. Vary leverage levels. Number each."
-        ),
-        "posts_per_round": 3,
-    },
-    {
-        "name": "Pure Newbie",
-        "count": 45,
-        "system": (
-            "You represent 45 complete crypto newbies who bought BTC last month. "
-            "No understanding of market cycles, TA, or fundamentals. Heard about BTC from TikTok/friends. "
-            "Generate {n_posts} SHORT diverse posts (1-2 sentences each). "
-            "Ask naive questions, express confusion, panic at any red day. Number each."
-        ),
-        "posts_per_round": 3,
-    },
-    {
-        "name": "DeFi User",
-        "count": 35,
-        "system": (
-            "You represent 35 DeFi users with BTC as collateral in lending protocols. "
-            "They monitor health factors and liquidation thresholds obsessively. "
-            "Generate {n_posts} SHORT posts (1-2 sentences each). "
-            "Talk about collateral ratios, liquidation prices, depegs, protocol risk. Number each."
-        ),
-        "posts_per_round": 2,
-    },
-    {
-        "name": "KOL Influencer",
-        "count": 25,
-        "system": (
-            "You represent 25 crypto influencers with large followings. "
-            "They amplify whatever narrative gets engagement — bearish during dumps, bullish during pumps. "
-            "They use dramatic, sensational language. "
-            "Generate {n_posts} SHORT viral-style posts (1-2 sentences each). "
-            "Some bearish doom, some contrarian bullish calls. Use crypto slang. Number each."
-        ),
-        "posts_per_round": 3,
-    },
-    {
-        "name": "Miner",
-        "count": 20,
-        "system": (
-            "You represent 20 BTC miners with break-even costs $35K-$50K. "
-            "They care about hashrate, difficulty, energy costs, mining profitability. "
-            "Generate {n_posts} SHORT posts (1-2 sentences each). "
-            "Provide mining perspective on price moves. Number each."
-        ),
-        "posts_per_round": 2,
-    },
-    {
-        "name": "Institutional",
-        "count": 25,
-        "system": (
-            "You represent 25 institutional investors (hedge funds, family offices). "
-            "Data-driven, contrarian — they buy when retail panics. "
-            "They look at on-chain data, macro indicators, risk metrics. "
-            "Generate {n_posts} SHORT analytical posts (1-2 sentences each). "
-            "Calm, measured, contrarian. Number each."
-        ),
-        "posts_per_round": 2,
-    },
-    {
-        "name": "Diamond Hands OG",
-        "count": 50,
-        "system": (
-            "You represent 50 long-term BTC holders since 2017. "
-            "They've survived 3+ crashes of -80%. Nothing phases them. "
-            "They believe in BTC fundamentals and see crashes as buying opportunities. "
-            "Generate {n_posts} SHORT dismissive/calm posts (1-2 sentences each). "
-            "Some zen, some mocking panic sellers, some quietly accumulating. Number each."
-        ),
-        "posts_per_round": 3,
-    },
-]
 
 
 class MiroFishSimulator:
@@ -145,9 +23,9 @@ class MiroFishSimulator:
     def run_simulation(
         self, social_posts: list[dict], market_data: dict
     ) -> dict:
-        """Two-stage pipeline: mega-batch analysis → 500-agent conversation."""
+        """Two-stage pipeline: LLM sentiment → OASIS multi-agent simulation."""
 
-        # === Stage 1: Analyze ALL posts ===
+        # === Stage 1: Analyze ALL posts via OpenRouter ===
         print(f"\n[Stage 1] Analyzing {len(social_posts)} posts via OpenRouter...")
         stats = self.analyzer.analyze_all(social_posts)
         print(format_sentiment_report(stats))
@@ -155,23 +33,24 @@ class MiroFishSimulator:
         stage1_score = stats.to_fear_score()
         print(f"[Stage 1] Base fear score: {stage1_score:.1f}/100")
 
-        # === Stage 2: 500-agent conversation ===
-        stage2_result = self._run_500_agent_conversation(stats, market_data)
+        # === Stage 2: OASIS multi-agent simulation ===
+        oasis_result = self._run_oasis(stats, market_data)
 
-        if stage2_result:
+        if oasis_result and oasis_result.get("agent_generated_content"):
+            # Score OASIS output with LLM
+            stage2_result = self._score_simulation(oasis_result, market_data, stats)
             stage2_score = stage2_result.get("sentiment_score", stage1_score)
+
+            # Blend: Stage 1 (40% grounded) + Stage 2 (60% contagion dynamics)
             final_score = stage1_score * 0.4 + stage2_score * 0.6
 
-            total_agents = sum(t["count"] for t in AGENT_TYPES)
             return {
                 "sentiment_score": round(final_score, 2),
                 "stage1_score": stage1_score,
                 "stage2_score": stage2_score,
                 "agent_responses": stage2_result.get("agent_responses", []),
-                "method": "500_agent_conversation",
+                "method": "oasis_simulation",
                 "num_posts_analyzed": stats.analyzed_posts,
-                "num_agents": total_agents,
-                "num_rounds": NUM_ROUNDS,
                 "sentiment_stats": {
                     "mean": stats.mean_score,
                     "median": stats.median_score,
@@ -183,10 +62,16 @@ class MiroFishSimulator:
                     "extreme_greed_pct": round(stats.extreme_greed_ratio * 100, 1),
                     "source_scores": stats.source_scores,
                 },
+                "oasis_stats": {
+                    "total_posts": oasis_result.get("total_posts", 0),
+                    "total_comments": oasis_result.get("total_comments", 0),
+                    "total_actions": oasis_result.get("total_actions", 0),
+                    "agent_content": len(oasis_result.get("agent_generated_content", [])),
+                },
             }
 
-        # Fallback
-        print("[Stage 2] 500-agent simulation failed, using Stage 1 only")
+        # Fallback: Stage 1 only
+        print("[Stage 2] OASIS failed, using Stage 1 score only")
         return {
             "sentiment_score": stage1_score,
             "stage1_score": stage1_score,
@@ -202,223 +87,161 @@ class MiroFishSimulator:
             },
         }
 
-    def _call_llm(self, system: str, user: str, max_tokens: int = 800) -> str:
-        """Call LLM with automatic model fallback."""
-        return self.llm.call(user, system=system, temperature=0.85, max_tokens=max_tokens)
-
-    def _run_500_agent_conversation(self, stats: SentimentStats, market_data: dict) -> dict:
-        """Run 500 agents (batched by type) × 3 rounds of conversation.
-
-        Each round: 10 API calls (one per agent type), each generating
-        multiple posts from all agents of that type. ~30 API calls total.
-        """
-        raw = market_data.get("raw", {})
-
-        fear_samples = "\n".join(
-            f"  - {p.get('text', '')[:120]}"
-            for p in stats.top_fear_posts[:5]
-        )
-        greed_samples = "\n".join(
-            f"  - {p.get('text', '')[:120]}"
-            for p in stats.top_greed_posts[:5]
-        )
-
-        market_context = (
-            f"BTC: ${raw.get('price_usd', 0):,.0f} | 24h: {raw.get('change_24h_pct', 0):.2f}% "
-            f"| Dominance: {raw.get('btc_dominance', 0):.1f}%\n"
-            f"Sentiment from {stats.analyzed_posts:,d} real posts: "
-            f"Fear {(stats.extreme_fear_ratio + stats.fear_ratio) * 100:.0f}% / "
-            f"Neutral {stats.neutral_ratio * 100:.0f}% / "
-            f"Greed {(stats.greed_ratio + stats.extreme_greed_ratio) * 100:.0f}%\n\n"
-            f"Top fear posts:\n{fear_samples}\n\nTop greed posts:\n{greed_samples}"
-        )
-
-        all_posts = []
-        total_agents = sum(t["count"] for t in AGENT_TYPES)
-
+    def _run_oasis(self, stats: SentimentStats, market_data: dict) -> dict:
+        """Run OASIS in mirofish conda env with Stage 1 stats as input."""
         try:
-            for round_num in range(1, NUM_ROUNDS + 1):
-                if round_num > 1:
-                    time.sleep(12)  # Rate limit buffer
+            # Serialize stats for OASIS
+            stats_dict = {
+                "analyzed_posts": stats.analyzed_posts,
+                "mean_score": stats.mean_score,
+                "median_score": stats.median_score,
+                "extreme_fear_ratio": stats.extreme_fear_ratio,
+                "fear_ratio": stats.fear_ratio,
+                "neutral_ratio": stats.neutral_ratio,
+                "greed_ratio": stats.greed_ratio,
+                "extreme_greed_ratio": stats.extreme_greed_ratio,
+                "representative_posts": stats.representative_posts[:50],
+                "top_fear_posts": stats.top_fear_posts[:10],
+                "top_greed_posts": stats.top_greed_posts[:10],
+            }
 
-                print(f"[Stage 2] Round {round_num}/{NUM_ROUNDS} "
-                      f"({total_agents} agents across {len(AGENT_TYPES)} types)...")
+            inputs = {
+                "sentiment_stats": stats_dict,
+                "market_data": market_data,
+                "max_rounds": 3,
+            }
+            input_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, dir="/tmp"
+            )
+            json.dump(inputs, input_file, ensure_ascii=False)
+            input_file.close()
 
-                if round_num == 1:
-                    forum_context = (
-                        f"Today's market:\n{market_context}\n\n"
-                        f"React to this data on a crypto Reddit forum."
-                    )
-                else:
-                    # Show recent posts from ALL types
-                    recent = all_posts[-(total_agents // 3 * 2):]  # Last ~2 rounds worth
-                    recent_text = "\n".join(
-                        f"[{p['type']}] {p['text']}"
-                        for p in recent[-40:]  # Cap at 40 to fit context
-                    )
-                    forum_context = (
-                        f"Market:\n{market_context}\n\n"
-                        f"Recent forum posts:\n{recent_text}\n\n"
-                        f"Respond to the discussion. React to what others are saying."
-                    )
+            output_file = input_file.name.replace(".json", "_output.json")
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-                round_posts = self._run_round(forum_context, round_num)
-                all_posts.extend(round_posts)
+            # Pass OpenRouter env vars to the conda subprocess
+            env_exports = (
+                f"import os; "
+                f"os.environ['OPENROUTER_API_KEY'] = '{os.getenv('OPENROUTER_API_KEY', '')}'; "
+                f"os.environ['OPENROUTER_BASE_URL'] = '{os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')}'; "
+                f"os.environ['OPENROUTER_MODEL'] = '{os.getenv('OPENROUTER_MODEL', 'nvidia/nemotron-3-super-120b-a12b')}'; "
+            )
 
-                # Print summary
-                type_counts = {}
-                for p in round_posts:
-                    type_counts[p["type"]] = type_counts.get(p["type"], 0) + 1
-                total_round = sum(type_counts.values())
-                print(f"    Generated {total_round} posts from {len(type_counts)} types")
+            script = f"""
+{env_exports}
+import sys
+sys.path.insert(0, '{project_root}')
+import json
+import asyncio
+from mirofish.oasis_runner import OasisSimulator
 
-            # === Score the full conversation ===
-            print(f"[Stage 2] Scoring {len(all_posts)} posts from {total_agents} agents...")
-            result = self._score_conversation(all_posts, market_context)
-            return result
+with open('{input_file.name}') as f:
+    inputs = json.load(f)
 
+simulator = OasisSimulator()
+result = asyncio.run(simulator.run_simulation(
+    inputs['sentiment_stats'],
+    inputs['market_data'],
+    inputs['max_rounds'],
+))
+
+with open('{output_file}', 'w') as f:
+    json.dump(result, f, ensure_ascii=False)
+
+print('OASIS simulation complete')
+"""
+            print("[Stage 2] Running OASIS 500-agent simulation (conda mirofish)...")
+            result = subprocess.run(
+                ["conda", "run", "-n", "mirofish", "python", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=3600,
+                cwd=project_root,
+            )
+
+            if result.returncode != 0:
+                print(f"[OASIS] Error: {result.stderr[:500]}")
+                return None
+
+            with open(output_file) as f:
+                oasis_result = json.load(f)
+
+            content_count = len(oasis_result.get("agent_generated_content", []))
+            posts = oasis_result.get("total_posts", 0)
+            comments = oasis_result.get("total_comments", 0)
+            actions = oasis_result.get("total_actions", 0)
+            print(f"[OASIS] {content_count} content pieces "
+                  f"({posts} posts, {comments} comments, {actions} actions)")
+            return oasis_result
+
+        except subprocess.TimeoutExpired:
+            print("[OASIS] Simulation timed out (1 hour limit)")
+            return None
         except Exception as e:
-            print(f"[Stage 2] Error: {e}")
+            print(f"[OASIS] Failed: {e}")
             return None
 
-    def _run_round(self, forum_context: str, round_num: int) -> list[dict]:
-        """Run all agent types for one round, with controlled concurrency."""
-        all_posts = []
+    def _score_simulation(self, oasis_result: dict, market_data: dict, stats: SentimentStats) -> dict:
+        """Use LLM to analyze OASIS output for contagion dynamics."""
+        content = oasis_result.get("agent_generated_content", [])
 
-        with ThreadPoolExecutor(max_workers=TYPE_CONCURRENCY) as executor:
-            futures = {
-                executor.submit(
-                    self._generate_type_posts, agent_type, forum_context, round_num
-                ): agent_type
-                for agent_type in AGENT_TYPES
-            }
-            for future in as_completed(futures):
-                agent_type = futures[future]
-                try:
-                    posts = future.result()
-                    all_posts.extend(posts)
-                except Exception as e:
-                    print(f"    {agent_type['name']} failed: {e}")
+        content_text = "\n".join(
+            f"- [Agent {c['user_id']}, {c['type']}] {c['text'][:200]}"
+            for c in content[:50]
+        )
 
-        return all_posts
+        raw = market_data.get("raw", {})
+        prompt = f"""You are analyzing a multi-agent BTC investor simulation (OASIS/MiroFish engine)
+that was seeded with real-world social media sentiment data.
 
-    def _generate_type_posts(
-        self, agent_type: dict, forum_context: str, round_num: int
-    ) -> list[dict]:
-        """Generate posts for ALL agents of one type in a single API call."""
-        n_posts = agent_type["posts_per_round"]
-        system = agent_type["system"].format(n_posts=n_posts)
+STATISTICAL CONTEXT (from analyzing {stats.analyzed_posts:,d} real social media posts):
+- Overall sentiment: {stats.mean_score:.1f}/100 (0=extreme fear, 100=extreme greed)
+- Extreme Fear posts: {stats.extreme_fear_ratio * 100:.1f}%
+- Fear posts: {stats.fear_ratio * 100:.1f}%
+- Neutral: {stats.neutral_ratio * 100:.1f}%
+- Greed: {stats.greed_ratio * 100:.1f}%
+- Extreme Greed: {stats.extreme_greed_ratio * 100:.1f}%
 
-        text = self._call_llm(system, forum_context, max_tokens=600)
+MARKET: BTC ${raw.get('price_usd', 0):,.0f}, 24h {raw.get('change_24h_pct', 0):.2f}%
 
-        if text == "(no response)":
-            return []
+SIMULATION OUTPUT (500 agents interacting on simulated Reddit, {oasis_result.get('total_actions', 0)} total actions):
+{content_text}
 
-        # Parse numbered posts from response
-        posts = []
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line or len(line) < 10:
-                continue
-            # Strip numbering: "1. ...", "1) ...", "#1 ..."
-            clean = line
-            for prefix_len in range(1, 5):
-                if len(line) > prefix_len and line[prefix_len] in ".):- ":
-                    if line[:prefix_len].strip().isdigit():
-                        clean = line[prefix_len + 1:].strip()
-                        break
-            if clean.startswith("#"):
-                clean = clean.lstrip("#").strip()
-                for prefix_len in range(1, 4):
-                    if len(clean) > prefix_len and clean[prefix_len] in ".):- ":
-                        if clean[:prefix_len].strip().isdigit():
-                            clean = clean[prefix_len + 1:].strip()
-                            break
+Analyze the simulation: how did fear/greed SPREAD between agents?
+Did panic-prone agents infect calmer ones? Did HODLers stabilize sentiment?
 
-            if len(clean) > 15:
-                posts.append({
-                    "type": agent_type["name"],
-                    "count": agent_type["count"],
-                    "text": clean[:300],
-                    "round": round_num,
-                })
-
-        return posts[:n_posts]
-
-    def _score_conversation(self, all_posts: list[dict], market_context: str) -> dict:
-        """Analyze the full 500-agent conversation for contagion dynamics."""
-        # Group posts by type for summary
-        by_type = {}
-        for p in all_posts:
-            t = p["type"]
-            if t not in by_type:
-                by_type[t] = []
-            by_type[t].append(p)
-
-        # Build conversation summary
-        conv_parts = []
-        for agent_type in AGENT_TYPES:
-            name = agent_type["name"]
-            count = agent_type["count"]
-            posts = by_type.get(name, [])
-            if posts:
-                post_text = "\n".join(f"  - {p['text'][:150]}" for p in posts)
-                conv_parts.append(f"[{name}] ({count} agents, {len(posts)} posts):\n{post_text}")
-
-        conversation_text = "\n\n".join(conv_parts)
-
-        prompt = f"""Analyze this 500-agent BTC investor simulation for panic contagion dynamics.
-
-Market: {market_context[:300]}
-
-Conversation across {NUM_ROUNDS} rounds:
-{conversation_text}
-
-Analyze contagion: Did fear spread from KOLs/leveraged traders to retail/newbies?
-Did institutions/OGs stabilize or get infected? How did sentiment shift across rounds?
-
-Output ONLY this JSON:
-{{"overall_score": <0-100, 0=extreme fear, 100=extreme greed>, "contagion_effect": "<amplified|dampened|neutral>", "agents": [{{"name": "<type>", "panic_level": <0-100>, "reasoning": "<1 sentence>"}}]}}"""
+Output JSON only:
+{{"overall_score": <0-100 fear score>, "contagion_effect": "<amplified|dampened|neutral>", "agents": [{{"name": "<type>", "panic_level": <0-100>, "reasoning": "<1 sentence>"}}]}}"""
 
         try:
             text = self.llm.call(prompt, temperature=0.1, max_tokens=2000)
+
             if not text or text == "(no response)":
-                print("[Stage 2] Scoring: no response from LLM")
-                return None
+                return {"sentiment_score": stats.to_fear_score(), "agent_responses": []}
 
             start = text.find("{")
             end = text.rfind("}") + 1
-            if start < 0 or end <= start:
-                print(f"[Stage 2] Scoring: no JSON found in response ({len(text)} chars)")
-                print(f"[Stage 2] Response preview: {text[:200]}")
-                return None
+            if start >= 0 and end > start:
+                json_str = text[start:end]
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError:
+                    # Repair truncated JSON
+                    if json_str.count("[") > json_str.count("]"):
+                        last_brace = json_str.rfind("}")
+                        if last_brace > 0:
+                            json_str = json_str[:last_brace + 1] + "]}"
+                    data = json.loads(json_str)
 
-            json_str = text[start:end]
-            try:
-                data = json.loads(json_str)
-            except json.JSONDecodeError:
-                # Try to repair truncated JSON: close open arrays/objects
-                repaired = json_str
-                if repaired.count("[") > repaired.count("]"):
-                    # Truncated inside agents array — close it
-                    last_brace = repaired.rfind("}")
-                    if last_brace > 0:
-                        repaired = repaired[:last_brace + 1] + "]}"
-                data = json.loads(repaired)
-            contagion = data.get("contagion_effect", "neutral")
-            score = data.get("overall_score", 50)
-            print(f"[Stage 2] Contagion: {contagion} | Score: {score}/100")
+                contagion = data.get("contagion_effect", "neutral")
+                print(f"[Stage 2] Contagion effect: {contagion}")
+                return {
+                    "sentiment_score": data.get("overall_score", 50),
+                    "agent_responses": data.get("agents", []),
+                    "contagion_effect": contagion,
+                }
 
-            return {
-                "sentiment_score": score,
-                "agent_responses": data.get("agents", []),
-                "contagion_effect": contagion,
-            }
-
-        except json.JSONDecodeError as e:
-            print(f"[Stage 2] JSON parse error: {e}")
-            print(f"[Stage 2] Raw: {text[start:start+300] if 'text' in dir() else 'N/A'}")
-            return None
         except Exception as e:
             print(f"[Stage 2] Scoring error: {e}")
-            return None
+
+        return {"sentiment_score": stats.to_fear_score(), "agent_responses": []}
