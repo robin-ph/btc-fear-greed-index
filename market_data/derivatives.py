@@ -3,8 +3,8 @@
 All endpoints are public, no auth needed.
 """
 
-import requests
 import numpy as np
+from market_data import RobustSession
 
 
 BINANCE_FUTURES_BASE = "https://fapi.binance.com"
@@ -12,7 +12,7 @@ BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
 class DerivativesClient:
     def __init__(self):
-        self.session = requests.Session()
+        self.session = RobustSession()
         self.session.headers.update({"Accept": "application/json"})
 
     def get_funding_rate(self) -> float:

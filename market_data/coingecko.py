@@ -1,14 +1,14 @@
 """CoinGecko free API - BTC market data."""
 
-import requests
 import numpy as np
 from config.settings import COINGECKO_BASE_URL
+from market_data import RobustSession
 
 
 class CoinGeckoClient:
     def __init__(self):
         self.base_url = COINGECKO_BASE_URL
-        self.session = requests.Session()
+        self.session = RobustSession()
         self.session.headers.update({"Accept": "application/json"})
 
     def get_btc_price_data(self) -> dict:
@@ -46,12 +46,19 @@ class CoinGeckoClient:
         return [p[1] for p in resp.json()["prices"]]
 
     def calc_volatility(self, prices: list[float]) -> float:
-        """Calculate annualized volatility from daily prices.
+        """Calculate annualized volatility from price data.
 
+        CoinGecko returns hourly data for 30-day queries (~722 points).
+        We resample to daily closes before annualizing with sqrt(365).
         Returns a 0-100 score where higher = more volatile = more fear.
         """
         if len(prices) < 2:
             return 50.0
+
+        # Resample to daily: if hourly data (>50 points), take every 24th point
+        if len(prices) > 50:
+            prices = prices[::24]
+
         prices_arr = np.array(prices)
         daily_returns = np.diff(prices_arr) / prices_arr[:-1]
         volatility = np.std(daily_returns) * np.sqrt(365) * 100  # annualized %

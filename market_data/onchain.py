@@ -3,13 +3,13 @@
 Uses blockchain.com and mempool.space free APIs (no auth needed).
 """
 
-import requests
 import numpy as np
+from market_data import RobustSession
 
 
 class OnchainClient:
     def __init__(self):
-        self.session = requests.Session()
+        self.session = RobustSession()
 
     def get_mempool_fees(self) -> dict:
         """Current recommended fees from mempool.space."""

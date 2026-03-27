@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
 from config.settings import BINANCE_SQUARE_MAX_POSTS, BINANCE_SQUARE_HASHTAGS
+from scrapers import ProxyBroken, is_proxy_error
 
 
 class BinanceSquareScraper:
@@ -16,29 +17,41 @@ class BinanceSquareScraper:
         self.collected_posts = []
         seen = set()
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                try:
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1280, "height": 800},
+        for attempt in range(2):
+            launch_args = [] if attempt == 0 else ["--no-proxy-server"]
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True, args=launch_args or None
                     )
+                    try:
+                        context = await browser.new_context(
+                            user_agent=(
+                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                            viewport={"width": 1280, "height": 800},
+                        )
 
-                    for hashtag in BINANCE_SQUARE_HASHTAGS:
-                        if len(self.collected_posts) >= self.max_posts:
-                            break
-                        await self._scrape_hashtag(context, hashtag, seen)
+                        for hashtag in BINANCE_SQUARE_HASHTAGS:
+                            if len(self.collected_posts) >= self.max_posts:
+                                break
+                            await self._scrape_hashtag(context, hashtag, seen)
 
-                finally:
-                    await browser.close()
+                    finally:
+                        await browser.close()
+                break  # success, no retry needed
 
-        except Exception as e:
-            print(f"[BinanceSquare] Browser error: {e}")
+            except ProxyBroken:
+                if attempt == 0:
+                    print("[BinanceSquare] Proxy down, retrying direct...")
+                    self.collected_posts = []
+                    seen.clear()
+                    continue
+            except Exception as e:
+                print(f"[BinanceSquare] Browser error: {e}")
+                break
 
         # Deduplicate
         final = []
@@ -82,6 +95,8 @@ class BinanceSquareScraper:
                     self.collected_posts.append(post)
 
         except Exception as e:
+            if is_proxy_error(e):
+                raise ProxyBroken() from e
             if "Timeout" not in str(e):
                 print(f"[BinanceSquare] #{hashtag} error: {e}")
         finally:

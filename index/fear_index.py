@@ -2,6 +2,9 @@
 
 Combines traditional market metrics (60%) with two-stage MiroFish
 sentiment analysis + multi-agent simulation (40%).
+
+Index scale: 0 = extreme fear, 100 = extreme greed.
+Components on fear scale (higher = more fear) are inverted before aggregation.
 """
 
 from config.settings import WEIGHTS
@@ -15,17 +18,22 @@ LABELS = [
     (75, 100, "Extreme Greed"),
 ]
 
+# Components scored on fear scale (higher = more fear/volatile).
+# These are inverted (100 - score) to align with the greed-scale index.
+_FEAR_SCALE_COMPONENTS = {"volatility", "dominance", "mirofish_sentiment"}
+
 
 def calculate_fear_index(market_scores: dict, sentiment_score: float) -> dict:
     components = {}
     for key, weight in WEIGHTS.items():
         if key == "mirofish_sentiment":
-            components[key] = {"score": sentiment_score, "weight": weight}
+            raw = sentiment_score
         else:
-            components[key] = {
-                "score": market_scores.get(key, 50),
-                "weight": weight,
-            }
+            raw = market_scores.get(key, 50)
+
+        # Invert fear-scale scores to greed scale
+        score = (100 - raw) if key in _FEAR_SCALE_COMPONENTS else raw
+        components[key] = {"score": round(score, 2), "weight": weight}
 
     total = sum(c["score"] * c["weight"] for c in components.values())
     total_weight = sum(c["weight"] for c in components.values())

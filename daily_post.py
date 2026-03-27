@@ -333,6 +333,13 @@ def main():
     print("=" * 50)
 
     # ── Step 4: Post to Twitter ──
+    # Safety check: don't post if market data is missing (BTC $0)
+    market_price = result.get("market_raw", {}).get("price_usd", 0)
+    if market_price == 0 and not args.dry_run:
+        print("\n[!] BTC price is $0 — market data missing. Refusing to post.")
+        print("[!] Result and infographic saved locally. Fix and retry.")
+        sys.exit(1)
+
     if args.dry_run:
         print("\n[DRY RUN] Tweet not posted. Image and result saved locally.")
         # Print the final index report

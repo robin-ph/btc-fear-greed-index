@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
 from config.settings import TWITTER_MAX_TWEETS, TWITTER_KEYWORDS
+from scrapers import ProxyBroken, is_proxy_error
 
 
 # Expanded instance list for better availability
@@ -32,39 +33,50 @@ class TwitterScraper:
         all_tweets = []
         seen = set()
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                try:
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1280, "height": 900},
+        for attempt in range(2):
+            launch_args = [] if attempt == 0 else ["--no-proxy-server"]
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True, args=launch_args or None
                     )
-
-                    for nitter_url in NITTER_INSTANCES:
-                        if len(all_tweets) >= self.max_tweets:
-                            break
-
-                        working = await self._try_instance(
-                            context, nitter_url, seen, all_tweets
+                    try:
+                        context = await browser.new_context(
+                            user_agent=(
+                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                            viewport={"width": 1280, "height": 900},
                         )
 
-                        if working:
-                            print(f"[Twitter] {nitter_url}: {len(all_tweets)} tweets")
-                            # Try pagination on working instance
-                            await self._paginate_instance(
+                        for nitter_url in NITTER_INSTANCES:
+                            if len(all_tweets) >= self.max_tweets:
+                                break
+
+                            working = await self._try_instance(
                                 context, nitter_url, seen, all_tweets
                             )
-                            break  # Found working instance
 
-                finally:
-                    await browser.close()
+                            if working:
+                                print(f"[Twitter] {nitter_url}: {len(all_tweets)} tweets")
+                                await self._paginate_instance(
+                                    context, nitter_url, seen, all_tweets
+                                )
+                                break
 
-        except Exception as e:
-            print(f"[Twitter] Browser error: {e}")
+                    finally:
+                        await browser.close()
+                break  # success
+
+            except ProxyBroken:
+                if attempt == 0:
+                    print("[Twitter] Proxy down, retrying direct...")
+                    all_tweets.clear()
+                    seen.clear()
+                    continue
+            except Exception as e:
+                print(f"[Twitter] Browser error: {e}")
+                break
 
         if not all_tweets:
             print("[Twitter] All Nitter instances down — 0 tweets collected")
@@ -128,7 +140,12 @@ class TwitterScraper:
 
     async def _scrape_search(self, page, base_url: str, term: str) -> list[dict]:
         url = f"{base_url}/search?f=tweets&q={term}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as e:
+            if is_proxy_error(e):
+                raise ProxyBroken() from e
+            raise
         await page.wait_for_timeout(2000)
         return await self._extract_tweets(page)
 
