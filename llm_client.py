@@ -1,7 +1,7 @@
-"""Shared OpenRouter LLM client with automatic free model fallback.
+"""Shared LLM client with multi-provider parallel dispatch.
 
-If the primary model hits rate limits or quota, automatically tries
-the next free model. All models are free ($0) on OpenRouter.
+Distributes calls across Groq, Cerebras, and OpenRouter to avoid
+single-provider rate limits. Each provider has its own API key and models.
 """
 
 import os
@@ -10,43 +10,95 @@ import time
 from openai import OpenAI
 
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# === Provider groups (each group = one API with its own rate limit) ===
+PROVIDER_GROUPS = []  # list of {"name", "api_key", "base_url", "models": [...]}
 
-# Models ranked by capability (paid pennies, free as fallback)
-MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b",       # $0.10/M input — best quality
-    "nvidia/nemotron-3-nano-30b-a3b",           # $0.05/M input — fast fallback
-    "nvidia/nemotron-3-super-120b-a12b:free",   # Free tier (may have quota limits)
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "stepfun/step-3.5-flash:free",
-    "minimax/minimax-m2.5:free",
-]
+_gq_key = os.getenv("GROQ_API_KEY", "")
+if _gq_key:
+    PROVIDER_GROUPS.append({
+        "name": "groq",
+        "api_key": _gq_key,
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    })
 
-# Allow env override for primary model
-PRIMARY_MODEL = os.getenv("OPENROUTER_MODEL", MODELS[0])
+_cb_key = os.getenv("CEREBRAS_API_KEY", "")
+if _cb_key:
+    PROVIDER_GROUPS.append({
+        "name": "cerebras",
+        "api_key": _cb_key,
+        "base_url": "https://api.cerebras.ai/v1",
+        "models": ["llama-4-scout-17b-16e-instruct", "llama3.3-70b"],
+    })
+
+_or_key = os.getenv("OPENROUTER_API_KEY", "")
+if _or_key:
+    _or_primary = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    _or_models = [
+        # Paid (pennies)
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-3-nano-30b-a3b",
+        # Free — high quality
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free",
+        "google/gemma-3-27b-it:free",
+        "openai/gpt-oss-120b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "stepfun/step-3.5-flash:free",
+        "minimax/minimax-m2.5:free",
+    ]
+    ordered = [_or_primary] + [m for m in _or_models if m != _or_primary]
+    PROVIDER_GROUPS.append({
+        "name": "openrouter",
+        "api_key": _or_key,
+        "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        "models": ordered,
+    })
+
+# Flatten for total count
+PROVIDERS = []
+for g in PROVIDER_GROUPS:
+    for model in g["models"]:
+        PROVIDERS.append({
+            "name": f"{g['name']}/{model.split('/')[-1][:30]}",
+            "api_key": g["api_key"],
+            "base_url": g["base_url"],
+            "model": model,
+            "group": g["name"],
+        })
+
+NUM_GROUPS = len(PROVIDER_GROUPS)
 
 
 class LLMClient:
-    """OpenRouter client with automatic model fallback on rate limit / quota exhaustion."""
+    """Multi-provider LLM client with round-robin group dispatch."""
 
     def __init__(self):
-        self.client = OpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
-        )
-        # Build model priority: env primary first, then fallbacks
-        self.models = [PRIMARY_MODEL]
-        for m in MODELS:
-            if m not in self.models:
-                self.models.append(m)
-
-        self._current_model_idx = 0
-        self._failed_models = set()
+        self._clients = {}
+        self._failed = set()
+        self._fail_timestamps = {}
 
     @property
     def current_model(self) -> str:
-        return self.models[self._current_model_idx]
+        if not PROVIDERS:
+            return "none"
+        return PROVIDERS[0]["name"]
+
+    def _get_client(self, base_url: str, api_key: str) -> OpenAI:
+        key = f"{base_url}|{api_key[:8]}"
+        if key not in self._clients:
+            self._clients[key] = OpenAI(api_key=api_key, base_url=base_url)
+        return self._clients[key]
+
+    def _is_failed(self, pname: str) -> bool:
+        if pname not in self._failed:
+            return False
+        if time.time() - self._fail_timestamps.get(pname, 0) > 60:
+            self._failed.discard(pname)
+            return False
+        return True
 
     def call(
         self,
@@ -54,32 +106,40 @@ class LLMClient:
         system: str = None,
         temperature: float = 0.1,
         max_tokens: int = 800,
+        start_group: int = 0,
     ) -> str:
-        """Call LLM with automatic fallback across free models.
+        """Call LLM with fallback. start_group rotates which provider to try first."""
+        if not PROVIDERS:
+            return "(no response)"
 
-        Returns response text, or "(no response)" if all models fail.
-        """
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        # Try each model in priority order
-        tried = 0
+        # Build provider order: start from start_group, then round-robin other groups
+        ordered_providers = []
+        for offset in range(NUM_GROUPS):
+            group = PROVIDER_GROUPS[(start_group + offset) % NUM_GROUPS]
+            for model in group["models"]:
+                ordered_providers.append({
+                    "name": f"{group['name']}/{model.split('/')[-1][:30]}",
+                    "api_key": group["api_key"],
+                    "base_url": group["base_url"],
+                    "model": model,
+                })
 
-        while tried < len(self.models):
-            model = self.models[self._current_model_idx]
-
-            if model in self._failed_models:
-                self._advance_model()
-                tried += 1
+        for provider in ordered_providers:
+            pname = provider["name"]
+            if self._is_failed(pname):
                 continue
 
-            success = False
+            client = self._get_client(provider["base_url"], provider["api_key"])
+
             for attempt in range(2):
                 try:
-                    response = self.client.chat.completions.create(
-                        model=model,
+                    response = client.chat.completions.create(
+                        model=provider["model"],
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
@@ -87,42 +147,34 @@ class LLMClient:
                     content = response.choices[0].message.content
                     if content and content.strip():
                         return content.strip()
-                    # Empty response — retry once, then switch model
                     if attempt == 0:
-                        time.sleep(2)
+                        time.sleep(1)
                         continue
                 except Exception as e:
-                    err = str(e)
-                    if any(k in err.lower() for k in ["429", "quota", "rate limit", "402", "insufficient"]):
+                    err = str(e).lower()
+                    if any(k in err for k in ["429", "quota", "rate limit", "402", "insufficient"]):
                         if attempt == 0:
-                            time.sleep(5)
+                            time.sleep(3)
                             continue
-                        break  # Switch model
+                        break
                     else:
                         if attempt == 0:
-                            time.sleep(2)
+                            time.sleep(1)
                             continue
                         break
 
-            # Model failed after retries — mark and switch
-            print(f"[LLM] {model} failed, trying next model...")
-            self._failed_models.add(model)
-            self._advance_model()
-            tried += 1
+            print(f"[LLM] {pname} failed, trying next...")
+            self._failed.add(pname)
+            self._fail_timestamps[pname] = time.time()
 
         return "(no response)"
 
-    def _advance_model(self):
-        """Move to next model in priority list."""
-        self._current_model_idx = (self._current_model_idx + 1) % len(self.models)
 
-
-# Singleton instance
+# Singleton
 _client = None
 
 
 def get_client() -> LLMClient:
-    """Get shared LLM client instance."""
     global _client
     if _client is None:
         _client = LLMClient()
