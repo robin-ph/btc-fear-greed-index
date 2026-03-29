@@ -35,10 +35,7 @@ _or_key = os.getenv("OPENROUTER_API_KEY", "")
 if _or_key:
     _or_primary = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
     _or_models = [
-        # Paid (pennies)
-        "nvidia/nemotron-3-super-120b-a12b",
-        "nvidia/nemotron-3-nano-30b-a3b",
-        # Free — high quality
+        # All free ($0) models only
         "meta-llama/llama-3.3-70b-instruct:free",
         "nousresearch/hermes-3-llama-3.1-405b:free",
         "qwen/qwen3-next-80b-a3b-instruct:free",
@@ -49,7 +46,7 @@ if _or_key:
         "stepfun/step-3.5-flash:free",
         "minimax/minimax-m2.5:free",
     ]
-    ordered = [_or_primary] + [m for m in _or_models if m != _or_primary]
+    ordered = _or_models
     PROVIDER_GROUPS.append({
         "name": "openrouter",
         "api_key": _or_key,
